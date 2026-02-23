@@ -1,0 +1,18 @@
+.{
+    .name = .zig_structure_queries,
+    .fingerprint = 0xa411f5350fb5bbf2,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .sqlite = .{
+            .url = "https://github.com/vrischmann/zig-sqlite/archive/refs/heads/master.tar.gz",
+            .hash = "1220fd5fc5e3bd6959d4aec2fad0ee1da7b816e4a133637ec884f6ae968d085c1015",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
