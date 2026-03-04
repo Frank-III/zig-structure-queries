@@ -788,6 +788,115 @@ fn GenerateSql(comptime Tables: anytype, comptime Joins: anytype, comptime field
     }
 }
 
+fn placeholderListComptime(comptime count: usize) []const u8 {
+    comptime var sql: []const u8 = "(";
+    inline for (0..count) |index| {
+        if (index > 0) sql = sql ++ ", ";
+        sql = sql ++ "?";
+    }
+    sql = sql ++ ")";
+    return sql;
+}
+
+fn valueSqlParamComptime(comptime value: Value) []const u8 {
+    return switch (value) {
+        .int, .float, .string, .bool_val, .named_param => "?",
+        .null_value => "NULL",
+        .array_int => |arr| placeholderListComptime(arr.len),
+        .array_float => |arr| placeholderListComptime(arr.len),
+        .array_string => |arr| placeholderListComptime(arr.len),
+        .range_int, .range_float => "? AND ?",
+    };
+}
+
+fn conditionSqlComptime(comptime cond: Condition, comptime placeholder_mode: bool) []const u8 {
+    comptime var sql: []const u8 = "";
+    if (cond.negated) sql = sql ++ "NOT (";
+
+    if (cond.op == .match_table) {
+        sql = sql ++ cond.field.table ++ " " ++ cond.op.toSql();
+    } else {
+        sql = sql ++ cond.field.table ++ "." ++ cond.field.column ++ " " ++ cond.op.toSql();
+    }
+
+    if (cond.op != .is_null and cond.op != .is_not_null) {
+        sql = sql ++ " ";
+        if (placeholder_mode) {
+            sql = sql ++ valueSqlParamComptime(cond.value);
+        } else {
+            @compileError("conditionSqlComptime currently supports placeholder mode only");
+        }
+    }
+
+    if (cond.negated) sql = sql ++ ")";
+    return sql;
+}
+
+fn logicalConditionSqlComptime(comptime logical: LogicalCondition, comptime placeholder_mode: bool) []const u8 {
+    comptime var stack: [MAX_LOGICAL_TOKENS][]const u8 = undefined;
+    comptime var stack_len: usize = 0;
+
+    inline for (logical.tokens[0..logical.len]) |token| {
+        switch (token) {
+            .condition => |cond| {
+                stack[stack_len] = conditionSqlComptime(cond, placeholder_mode);
+                stack_len += 1;
+            },
+            .op => |op| {
+                if (stack_len < 2) {
+                    @compileError("invalid logical condition expression");
+                }
+
+                const right = stack[stack_len - 1];
+                const left = stack[stack_len - 2];
+                stack_len -= 2;
+
+                stack[stack_len] = "(" ++ left ++ " " ++ logicalOpToSql(op) ++ " " ++ right ++ ")";
+                stack_len += 1;
+            },
+        }
+    }
+
+    if (stack_len != 1) {
+        @compileError("invalid logical condition expression");
+    }
+
+    return stack[0];
+}
+
+fn staticConditionSqlComptime(comptime expr: anytype, comptime placeholder_mode: bool) []const u8 {
+    const ExprType = @TypeOf(expr);
+    if (ExprType == Condition) return conditionSqlComptime(expr, placeholder_mode);
+    if (ExprType == LogicalCondition) return logicalConditionSqlComptime(expr, placeholder_mode);
+    @compileError("comptimeSql conditions must be Condition or LogicalCondition, got " ++ @typeName(ExprType));
+}
+
+fn GenerateSqlWithStaticConditions(comptime base_sql: []const u8, comptime static_conditions: anytype) []const u8 {
+    comptime {
+        const CondType = @TypeOf(static_conditions);
+        const cond_info = @typeInfo(CondType);
+        switch (cond_info) {
+            .@"struct" => |struct_info| {
+                if (!struct_info.is_tuple) {
+                    @compileError("comptimeSql expects a tuple literal, e.g. .{ cond1, cond2 }");
+                }
+            },
+            else => @compileError("comptimeSql expects a tuple literal, e.g. .{ cond1, cond2 }"),
+        }
+
+        var sql: []const u8 = base_sql;
+        if (static_conditions.len > 0) {
+            sql = sql ++ " WHERE ";
+            for (static_conditions, 0..) |cond, index| {
+                if (index > 0) sql = sql ++ " AND ";
+                sql = sql ++ staticConditionSqlComptime(cond, true);
+            }
+        }
+
+        return sql;
+    }
+}
+
 pub fn JoinBuilder(comptime Tables: anytype, comptime Joins: anytype) type {
     return struct {
         const Self = @This();
@@ -983,30 +1092,40 @@ pub fn SelectBuilder(comptime Tables: anytype, comptime Joins: anytype, comptime
             }
         }
 
-        pub fn toSql(self: *Self) ![]const u8 {
-            var sql = try std.ArrayListUnmanaged(u8).initCapacity(self.allocator, base_sql.len + 100);
-            errdefer sql.deinit(self.allocator);
-
-            try sql.appendSlice(self.allocator, base_sql);
-
+        pub fn toSqlInto(self: *Self, writer: anytype) !void {
+            try writer.writeAll(base_sql);
             if (self.conditions.items.len > 0 or self.logical_conditions.items.len > 0) {
-                try sql.appendSlice(self.allocator, " WHERE ");
+                try writer.writeAll(" WHERE ");
                 var wrote_any = false;
 
                 for (self.conditions.items) |cond| {
-                    if (wrote_any) try sql.appendSlice(self.allocator, " AND ");
-                    try writeConditionSql(sql.writer(self.allocator), cond, true);
+                    if (wrote_any) try writer.writeAll(" AND ");
+                    try writeConditionSql(writer, cond, true);
                     wrote_any = true;
                 }
 
                 for (self.logical_conditions.items) |logical| {
-                    if (wrote_any) try sql.appendSlice(self.allocator, " AND ");
-                    try writeLogicalConditionSql(sql.writer(self.allocator), self.allocator, logical, true);
+                    if (wrote_any) try writer.writeAll(" AND ");
+                    try writeLogicalConditionSql(writer, self.allocator, logical, true);
                     wrote_any = true;
                 }
             }
+        }
 
+        pub fn toSql(self: *Self) ![]const u8 {
+            var sql = try std.ArrayListUnmanaged(u8).initCapacity(self.allocator, base_sql.len + 100);
+            errdefer sql.deinit(self.allocator);
+
+            try self.toSqlInto(sql.writer(self.allocator));
             return sql.toOwnedSlice(self.allocator);
+        }
+
+        /// Generate SQL fully at comptime for fixed query shapes.
+        ///
+        /// `static_conditions` must be a tuple literal of `Condition` and/or `LogicalCondition`.
+        /// Values are rendered as placeholders (`?`), matching runtime `toSql` behavior.
+        pub fn comptimeSql(comptime static_conditions: anytype) []const u8 {
+            return comptime GenerateSqlWithStaticConditions(base_sql, static_conditions);
         }
 
         fn appendConditionValueNoParams(self: *Self, values: *std.ArrayListUnmanaged(Value), cond: Condition) !void {
@@ -1125,9 +1244,19 @@ pub fn Query(comptime Table: anytype) JoinBuilder(.{Table}, .{}) {
     return query(Table, std.heap.page_allocator);
 }
 
+/// Build a fixed-shape query intended for comptime SQL generation via `.comptimeSql(...)`.
+pub fn QueryStatic(comptime Table: anytype) JoinBuilder(.{Table}, .{}) {
+    return Query(Table);
+}
+
 /// Build a comptime query using a concrete allocator immediately.
 pub fn query(comptime Table: anytype, allocator: std.mem.Allocator) JoinBuilder(.{Table}, .{}) {
     return JoinBuilder(.{Table}, .{}).init(allocator);
+}
+
+/// Alias for QueryStatic() for ergonomic API symmetry.
+pub fn queryStatic(comptime Table: anytype) JoinBuilder(.{Table}, .{}) {
+    return QueryStatic(Table);
 }
 
 /// Alias for Query() to support a more SQL-like entrypoint style.
@@ -2354,6 +2483,63 @@ test "comptime builder - schema DSL values" {
     try std.testing.expect(std.mem.indexOf(u8, sql, "WHERE users.age >= ?") != null);
 }
 
+test "comptime builder - toSqlInto avoids intermediate string allocation" {
+    const allocator = std.testing.allocator;
+    const DB = schema(.{
+        .users = table("users", .{
+            .id = col(i32),
+            .name = col([]const u8),
+            .age = col(i32),
+        }),
+    });
+
+    var builder = query(DB.users, allocator)
+        .select(.{ DB.users.id, DB.users.name });
+    defer builder.deinit();
+
+    try builder.where(DB.users.age, .gte, 21);
+
+    var sql_buffer: std.ArrayListUnmanaged(u8) = .{};
+    defer sql_buffer.deinit(allocator);
+    try builder.toSqlInto(sql_buffer.writer(allocator));
+
+    const sql = try sql_buffer.toOwnedSlice(allocator);
+    defer allocator.free(sql);
+
+    try std.testing.expect(std.mem.indexOf(u8, sql, "SELECT users.id, users.name FROM users") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "WHERE users.age >= ?") != null);
+}
+
+test "comptime builder - static SQL path with fixed shape" {
+    const DB = ExampleDB;
+
+    const q = queryStatic(DB.users)
+        .join(DB.posts, DB.posts.user_id.eqField(DB.users.id))
+        .select(.{ .user_name = DB.users.name, .post_title = DB.posts.title });
+
+    const static_sql = comptime @TypeOf(q).comptimeSql(.{
+        DB.users.age.gte(18),
+        DB.posts.title.like("%Zig%"),
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, static_sql, "SELECT users.name AS \"user_name\", posts.title AS \"post_title\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, static_sql, "INNER JOIN posts ON posts.user_id = users.id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, static_sql, "WHERE users.age >= ? AND posts.title LIKE ?") != null);
+}
+
+test "comptime builder - static SQL supports logical expressions" {
+    const DB = ExampleDB;
+
+    const q = QueryStatic(DB.users)
+        .select(.{ DB.users.id, DB.users.name });
+
+    const static_sql = comptime @TypeOf(q).comptimeSql(.{
+        DB.users.age.gt(21).or_(DB.users.age.lt(18)),
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, static_sql, "WHERE (users.age > ? OR users.age < ?)") != null);
+}
+
 test "comptime builder - columns helper" {
     const allocator = std.testing.allocator;
     const DB = schema(.{
@@ -2553,9 +2739,9 @@ test "SQLite dialect operators - GLOB and REGEXP" {
         .select(DB.users.name)
         .from(DB.users)
         .where(.{
-            DB.users.name.glob("J*"),
-            DB.users.email.regexp(".+@example\\.com"),
-        });
+        DB.users.name.glob("J*"),
+        DB.users.email.regexp(".+@example\\.com"),
+    });
 
     const sql = try qb.toSql();
     defer allocator.free(sql);
@@ -2760,9 +2946,9 @@ test "comptime join nullability - left join optional right side" {
     const Q = Query(DB.users)
         .leftJoin(DB.posts, DB.posts.user_id.eqField(DB.users.id))
         .select(.{
-            .user_name = DB.users.name,
-            .post_title = DB.posts.title,
-        });
+        .user_name = DB.users.name,
+        .post_title = DB.posts.title,
+    });
 
     const Row = @TypeOf(Q).ResultType;
     comptime {
@@ -2782,9 +2968,9 @@ test "comptime join nullability - right join optional left side" {
     const Q = Query(DB.users)
         .rightJoin(DB.posts, DB.posts.user_id.eqField(DB.users.id))
         .select(.{
-            .user_name = DB.users.name,
-            .post_title = DB.posts.title,
-        });
+        .user_name = DB.users.name,
+        .post_title = DB.posts.title,
+    });
 
     const Row = @TypeOf(Q).ResultType;
     comptime {
@@ -2867,7 +3053,7 @@ test "comptime builder - SQLite MATCH with typed params" {
     const SearchParams = params(.{ .q = []const u8 });
 
     var builder = query(DB.docs_fts, allocator)
-        .select(.{ DB.docs_fts.title });
+        .select(.{DB.docs_fts.title});
     defer builder.deinit();
 
     try builder.where(DB.docs_fts.title, .match, param("q", []const u8));

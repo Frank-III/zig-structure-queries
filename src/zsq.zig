@@ -8,7 +8,9 @@ const std = @import("std");
 // Type-safe query builder with field operators (PRIMARY API)
 pub const TypeSafe = @import("core/type_safe.zig");
 pub const Query = TypeSafe.Query; // The new comptime builder
+pub const QueryStatic = TypeSafe.QueryStatic;
 pub const query = TypeSafe.query;
+pub const queryStatic = TypeSafe.queryStatic;
 pub const from = TypeSafe.from;
 pub const QueryBuilder = TypeSafe.QueryBuilder; // The old builder (kept for now)
 pub const Field = TypeSafe.Field;
